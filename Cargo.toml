@@ -1,0 +1,13 @@
+[package]
+name = "task_queue_gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.27"
+egui = "0.27"
+rand = "0.8"
+
+[[bin]]
+name = "task_queue_gui"
+path = "src/main.rs"
