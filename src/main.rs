@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::time::Duration;
+use rand::Rng;
 
 // ============================================
 // ПРИОРИТЕТЫ
@@ -29,6 +30,16 @@ impl Priority {
             Priority::High => "HIGH",
             Priority::Medium => "MEDIUM",
             Priority::Low => "LOW",
+        }
+    }
+    
+    fn random() -> Self {
+        let mut rng = rand::thread_rng();
+        match rng.gen_range(0..4) {
+            0 => Priority::Critical,
+            1 => Priority::High,
+            2 => Priority::Medium,
+            _ => Priority::Low,
         }
     }
 }
@@ -106,16 +117,18 @@ struct Task {
     ramp_up_progress: u8,
     ramp_down_progress: u8,
     ramping_step: u32,
-    // Новые поля для времени
-    ramp_up_steps: u32,    // сколько шагов на запуск
-    ramp_down_steps: u32,  // сколько шагов на завершение
-    total_steps: u32,      // сколько всего шагов выполнения
-    current_step: u32,     // текущий шаг выполнения
+    ramp_up_steps: u32,
+    ramp_down_steps: u32,
+    total_steps: u32,
+    current_step: u32,
+    total_work_secs: u32,
+    ramp_up_secs: u32,
+    ramp_down_secs: u32,
+    saved_progress: u8,
 }
 
 impl Task {
     fn new(id: u64, name: String, priority: Priority, ramp_up_secs: u32, work_secs: u32, ramp_down_secs: u32) -> Self {
-        // Переводим секунды в шаги (1 шаг = 100 мс)
         let ramp_up_steps = ramp_up_secs * 10;
         let total_steps = work_secs * 10;
         let ramp_down_steps = ramp_down_secs * 10;
@@ -133,6 +146,10 @@ impl Task {
             ramp_down_steps,
             total_steps,
             current_step: 0,
+            total_work_secs: work_secs,
+            ramp_up_secs,
+            ramp_down_secs,
+            saved_progress: 0,
         }
     }
     
@@ -144,7 +161,6 @@ impl Task {
                     self.ramping_step = 0;
                     self.ramp_up_progress = 0;
                 } else {
-                    // Если нет времени на запуск, сразу в выполнение
                     self.state = TaskState::Running;
                     self.current_step = 0;
                 }
@@ -192,6 +208,7 @@ impl Task {
             TaskState::Running => self.progress as f32 / 100.0,
             TaskState::RampingDown => 1.0 - (self.ramp_down_progress as f32 / 100.0),
             TaskState::Completed => 1.0,
+            TaskState::Paused => self.saved_progress as f32 / 100.0,
             _ => 0.0,
         }
     }
@@ -210,7 +227,33 @@ impl Task {
                 let remaining_steps = self.ramp_down_steps - self.ramping_step;
                 remaining_steps as f32 / 10.0
             }
+            TaskState::Paused => {
+                let remaining_steps = self.total_steps - (self.progress as u32 * self.total_steps / 100);
+                remaining_steps as f32 / 10.0
+            }
             _ => 0.0,
+        }
+    }
+    
+    fn format_duration(&self) -> String {
+        format!("{}/{}/{}", self.ramp_up_secs, self.total_work_secs, self.ramp_down_secs)
+    }
+    
+    fn pause(&mut self) {
+        if self.state == TaskState::RampingUp || self.state == TaskState::Running || self.state == TaskState::RampingDown {
+            self.saved_progress = self.progress;
+            self.state = TaskState::Paused;
+        }
+    }
+    
+    fn resume(&mut self) {
+        if self.state == TaskState::Paused {
+            self.state = TaskState::Pending;
+            self.progress = self.saved_progress;
+            self.ramp_up_progress = 0;
+            self.ramp_down_progress = 0;
+            self.ramping_step = 0;
+            self.current_step = (self.progress as u32 * self.total_steps / 100);
         }
     }
 }
@@ -278,30 +321,22 @@ impl PriorityQueue {
         self.heap.peek()
     }
     
-    fn pause_task(&mut self, id: u64) -> Option<Task> {
-        let mut temp = Vec::new();
-        let mut found = None;
-        
-        while let Some(task) = self.heap.pop() {
-            if task.id == id && task.state == TaskState::Running {
-                let mut task = task;
-                task.state = TaskState::Paused;
-                found = Some(task);
-                break;
+    fn pause_current_task(&mut self) -> Option<Task> {
+        if let Some(mut task) = self.heap.pop() {
+            if task.state == TaskState::RampingUp || task.state == TaskState::Running || task.state == TaskState::RampingDown {
+                task.pause();
+                Some(task)
             } else {
-                temp.push(task);
+                self.heap.push(task);
+                None
             }
+        } else {
+            None
         }
-        
-        for task in temp {
-            self.heap.push(task);
-        }
-        
-        found
     }
     
     fn resume_task(&mut self, mut task: Task) {
-        task.state = TaskState::Pending;
+        task.resume();
         self.heap.push(task);
     }
     
@@ -342,6 +377,62 @@ impl PausedPool {
 }
 
 // ============================================
+// НАСТРОЙКИ РАНДОМИЗАЦИИ
+// ============================================
+#[derive(Clone)]
+struct RandomizeFlags {
+    name: bool,
+    priority: bool,
+    ramp_up: bool,
+    work_time: bool,
+    ramp_down: bool,
+}
+
+impl RandomizeFlags {
+    fn new() -> Self {
+        RandomizeFlags {
+            name: false,
+            priority: false,
+            ramp_up: false,
+            work_time: false,
+            ramp_down: false,
+        }
+    }
+    
+    fn all() -> Self {
+        RandomizeFlags {
+            name: true,
+            priority: true,
+            ramp_up: true,
+            work_time: true,
+            ramp_down: true,
+        }
+    }
+}
+
+// ============================================
+// ГЕНЕРАТОР СЛУЧАЙНЫХ ЗНАЧЕНИЙ
+// ============================================
+fn random_task_name() -> String {
+    let names = vec![
+        "Обновить базу данных",
+        "Сделать резервную копию",
+        "Отправить отчёт",
+        "Проверить логи",
+        "Написать документацию",
+        "Провести код-ревью",
+        "Задеплоить приложение",
+        "Запустить тесты",
+        "Оптимизировать запросы",
+        "Починить баг #42",
+        "Настроить CI/CD",
+        "Обновить зависимости",
+    ];
+    let mut rng = rand::thread_rng();
+    names[rng.gen_range(0..names.len())].to_string()
+}
+
+// ============================================
 // GUI ПРИЛОЖЕНИЕ
 // ============================================
 struct TaskQueueApp {
@@ -355,6 +446,8 @@ struct TaskQueueApp {
     new_task_ramp_down: u32,
     show_add_dialog: bool,
     status_message: String,
+    randomize_flags: RandomizeFlags,
+    keep_dialog_open: bool,
 }
 
 impl TaskQueueApp {
@@ -370,9 +463,10 @@ impl TaskQueueApp {
             new_task_ramp_down: 1,
             show_add_dialog: false,
             status_message: "Готов к работе".to_string(),
+            randomize_flags: RandomizeFlags::new(),
+            keep_dialog_open: false,
         };
         
-        // Добавляем тестовые задачи с разными временами
         app.queue.add_task("Отрендерить видео".to_string(), Priority::High, 2, 8, 1);
         app.queue.add_task("Ответить на письма".to_string(), Priority::Medium, 1, 3, 1);
         app.queue.add_task("Сделать бэкап".to_string(), Priority::Low, 3, 10, 2);
@@ -386,6 +480,48 @@ impl TaskQueueApp {
             let _completed = self.queue.step_current();
         }
     }
+    
+    fn apply_randomization(&mut self) {
+        let mut rng = rand::thread_rng();
+        
+        if self.randomize_flags.name {
+            self.new_task_name = random_task_name();
+        }
+        if self.randomize_flags.priority {
+            self.new_task_priority = Priority::random();
+        }
+        if self.randomize_flags.ramp_up {
+            self.new_task_ramp_up = rng.gen_range(0..=5);
+        }
+        if self.randomize_flags.work_time {
+            self.new_task_work_time = rng.gen_range(2..=15);
+        }
+        if self.randomize_flags.ramp_down {
+            self.new_task_ramp_down = rng.gen_range(0..=5);
+        }
+    }
+    
+    fn add_current_task(&mut self) {
+        if !self.new_task_name.is_empty() {
+            self.queue.add_task(
+                self.new_task_name.clone(),
+                self.new_task_priority.clone(),
+                self.new_task_ramp_up,
+                self.new_task_work_time,
+                self.new_task_ramp_down
+            );
+            self.status_message = format!("Задача '{}' добавлена", self.new_task_name);
+            
+            if !self.keep_dialog_open {
+                self.new_task_name.clear();
+                self.new_task_ramp_up = 1;
+                self.new_task_work_time = 5;
+                self.new_task_ramp_down = 1;
+            } else {
+                self.apply_randomization();
+            }
+        }
+    }
 }
 
 impl eframe::App for TaskQueueApp {
@@ -393,31 +529,49 @@ impl eframe::App for TaskQueueApp {
         self.update_simulation();
         ctx.request_repaint_after(Duration::from_millis(100));
         
-        // Верхнее меню
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("⏸ Пауза").clicked() {
+                if ui.button("⏸ Пауза симуляции").clicked() {
                     self.simulation_running = false;
                     self.status_message = "Симуляция на паузе".to_string();
                 }
-                if ui.button("▶ Старт").clicked() {
+                if ui.button("▶ Старт симуляции").clicked() {
                     self.simulation_running = true;
                     self.status_message = "Симуляция запущена".to_string();
                 }
+                if ui.button("⏸ Приостановить активную задачу").clicked() {
+                    if let Some(paused_task) = self.queue.pause_current_task() {
+                        self.paused_pool.add(paused_task);
+                        self.status_message = "Активная задача приостановлена".to_string();
+                    } else {
+                        self.status_message = "Нет активной задачи для приостановки".to_string();
+                    }
+                }
                 if ui.button("➕ Новая задача").clicked() {
                     self.show_add_dialog = true;
+                    self.keep_dialog_open = false;
+                    self.randomize_flags = RandomizeFlags::new();
+                }
+                if ui.button("🎲 Случайная задача").clicked() {
+                    let name = random_task_name();
+                    let priority = Priority::random();
+                    let mut rng = rand::thread_rng();
+                    let ramp_up = rng.gen_range(0..=3);
+                    let work_time = rng.gen_range(2..=12);
+                    let ramp_down = rng.gen_range(0..=3);
+                    self.queue.add_task(name.clone(), priority, ramp_up, work_time, ramp_down);
+                    self.status_message = format!("Случайная задача '{}' добавлена", name);
                 }
                 ui.separator();
                 ui.label(format!("Статус: {}", self.status_message));
             });
         });
         
-        // Диалог добавления задачи
         if self.show_add_dialog {
             egui::Window::new("➕ Новая задача")
                 .collapsible(false)
                 .resizable(false)
-                .default_size([350.0, 280.0])
+                .default_size([400.0, 450.0])
                 .show(ctx, |ui| {
                     ui.heading("Параметры задачи");
                     ui.separator();
@@ -425,6 +579,9 @@ impl eframe::App for TaskQueueApp {
                     ui.horizontal(|ui| {
                         ui.label("📝 Название:");
                         ui.text_edit_singleline(&mut self.new_task_name);
+                        if ui.button("🎲").clicked() {
+                            self.new_task_name = random_task_name();
+                        }
                     });
                     
                     ui.separator();
@@ -435,6 +592,9 @@ impl eframe::App for TaskQueueApp {
                         ui.radio_value(&mut self.new_task_priority, Priority::High, "High");
                         ui.radio_value(&mut self.new_task_priority, Priority::Medium, "Medium");
                         ui.radio_value(&mut self.new_task_priority, Priority::Low, "Low");
+                        if ui.button("🎲").clicked() {
+                            self.new_task_priority = Priority::random();
+                        }
                     });
                     
                     ui.separator();
@@ -447,6 +607,10 @@ impl eframe::App for TaskQueueApp {
                             .clamp_range(0..=10)
                             .speed(0.5));
                         ui.label("сек");
+                        if ui.button("🎲").clicked() {
+                            let mut rng = rand::thread_rng();
+                            self.new_task_ramp_up = rng.gen_range(0..=5);
+                        }
                     });
                     
                     ui.horizontal(|ui| {
@@ -455,6 +619,10 @@ impl eframe::App for TaskQueueApp {
                             .clamp_range(1..=30)
                             .speed(0.5));
                         ui.label("сек");
+                        if ui.button("🎲").clicked() {
+                            let mut rng = rand::thread_rng();
+                            self.new_task_work_time = rng.gen_range(2..=15);
+                        }
                     });
                     
                     ui.horizontal(|ui| {
@@ -463,63 +631,86 @@ impl eframe::App for TaskQueueApp {
                             .clamp_range(0..=10)
                             .speed(0.5));
                         ui.label("сек");
+                        if ui.button("🎲").clicked() {
+                            let mut rng = rand::thread_rng();
+                            self.new_task_ramp_down = rng.gen_range(0..=5);
+                        }
                     });
                     
                     ui.separator();
                     
-                    ui.label(format!("📊 Итого: {} сек (запуск: {} + работа: {} + завершение: {})",
-                        self.new_task_ramp_up + self.new_task_work_time + self.new_task_ramp_down,
-                        self.new_task_ramp_up,
-                        self.new_task_work_time,
-                        self.new_task_ramp_down));
+                    ui.label(format!("📊 Итого: {} сек", 
+                        self.new_task_ramp_up + self.new_task_work_time + self.new_task_ramp_down));
+                    
+                    ui.separator();
+                    
+                    ui.collapsing("🎲 Настройки рандомизации", |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("Всё случайно").clicked() {
+                                self.randomize_flags = RandomizeFlags::all();
+                                self.apply_randomization();
+                            }
+                            if ui.button("Сбросить").clicked() {
+                                self.randomize_flags = RandomizeFlags::new();
+                            }
+                        });
+                        
+                        ui.checkbox(&mut self.randomize_flags.name, "Случайное название");
+                        ui.checkbox(&mut self.randomize_flags.priority, "Случайный приоритет");
+                        ui.checkbox(&mut self.randomize_flags.ramp_up, "Случайный запуск");
+                        ui.checkbox(&mut self.randomize_flags.work_time, "Случайное время работы");
+                        ui.checkbox(&mut self.randomize_flags.ramp_down, "Случайное завершение");
+                        
+                        if ui.button("Применить рандомизацию").clicked() {
+                            self.apply_randomization();
+                        }
+                    });
+                    
+                    ui.checkbox(&mut self.keep_dialog_open, "Оставлять окно открытым");
                     
                     ui.separator();
                     
                     ui.horizontal(|ui| {
                         if ui.button("✅ Добавить").clicked() {
-                            if !self.new_task_name.is_empty() {
-                                self.queue.add_task(
-                                    self.new_task_name.clone(),
-                                    self.new_task_priority.clone(),
-                                    self.new_task_ramp_up,
-                                    self.new_task_work_time,
-                                    self.new_task_ramp_down
-                                );
-                                self.status_message = format!("Задача '{}' добавлена", self.new_task_name);
-                                self.new_task_name.clear();
-                                self.new_task_ramp_up = 1;
-                                self.new_task_work_time = 5;
-                                self.new_task_ramp_down = 1;
+                            self.add_current_task();
+                            if !self.keep_dialog_open {
                                 self.show_add_dialog = false;
                             }
                         }
-                        if ui.button("❌ Отмена").clicked() {
+                        if ui.button("➕ Добавить и очистить").clicked() {
+                            self.add_current_task();
+                            self.new_task_name.clear();
+                            self.new_task_ramp_up = 1;
+                            self.new_task_work_time = 5;
+                            self.new_task_ramp_down = 1;
+                        }
+                        if ui.button("❌ Закрыть").clicked() {
                             self.show_add_dialog = false;
                         }
                     });
                 });
         }
         
-        // Основная панель
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("🎯 Симулятор очереди с приоритетом");
             ui.separator();
             
-            // Текущая активная задача
             ui.collapsing("📌 Активная задача", |ui| {
                 let current_task_info = self.queue.current_task().map(|task| {
-                    (task.id, task.name.clone(), task.priority.clone(), task.state.clone(), 
+                    (task.name.clone(), task.priority.clone(), task.state.clone(), 
                      task.display_progress(), task.ramp_up_progress, task.progress, 
-                     task.ramp_down_progress, task.get_remaining_time_secs())
+                     task.ramp_down_progress, task.get_remaining_time_secs(),
+                     task.format_duration())
                 });
                 
-                if let Some((id, name, priority, state, progress, ramp_up, running_progress, ramp_down, remaining_time)) = current_task_info {
+                if let Some((name, priority, state, progress, ramp_up, running_progress, ramp_down, remaining_time, duration)) = current_task_info {
                     ui.horizontal(|ui| {
                         ui.label(format!("{} {}", state.emoji(), name));
                         ui.colored_label(priority.color(), priority.to_string());
+                        ui.label(format!("[{}]", duration));
                     });
                     ui.label(format!("Состояние: {}", state.to_string()));
-                    ui.label(format!("⏱️ Осталось: {:.1} сек", remaining_time));
+                    ui.label(format!("Осталось: {:.1} сек", remaining_time));
                     
                     let progress_bar = egui::ProgressBar::new(progress)
                         .desired_width(400.0)
@@ -528,22 +719,15 @@ impl eframe::App for TaskQueueApp {
                     
                     match state {
                         TaskState::RampingUp => {
-                            ui.label(format!("🚀 Прогресс запуска: {}%", ramp_up));
+                            ui.label(format!("Прогресс запуска: {}%", ramp_up));
                         }
                         TaskState::Running => {
-                            ui.label(format!("⚙️ Выполнено: {}%", running_progress));
+                            ui.label(format!("Выполнено: {}%", running_progress));
                         }
                         TaskState::RampingDown => {
-                            ui.label(format!("💾 Прогресс завершения: {}%", ramp_down));
+                            ui.label(format!("Прогресс завершения: {}%", ramp_down));
                         }
                         _ => {}
-                    }
-                    
-                    if ui.button("⏸ Приостановить эту задачу").clicked() {
-                        if let Some(paused_task) = self.queue.pause_task(id) {
-                            self.paused_pool.add(paused_task);
-                            self.status_message = format!("Задача {} приостановлена", name);
-                        }
                     }
                 } else {
                     ui.label("Нет активных задач");
@@ -552,23 +736,24 @@ impl eframe::App for TaskQueueApp {
             
             ui.separator();
             
-            // Очередь задач
             ui.collapsing("📋 Очередь задач", |ui| {
                 let tasks = self.queue.get_all_tasks();
                 if tasks.is_empty() {
                     ui.label("Очередь пуста");
                 } else {
-                    ui.columns(4, |columns| {
+                    ui.columns(5, |columns| {
                         columns[0].label("Состояние");
                         columns[1].label("Приоритет");
                         columns[2].label("Название");
-                        columns[3].label("Прогресс");
+                        columns[3].label("Время");
+                        columns[4].label("Прогресс");
                     });
                     for task in tasks {
                         ui.horizontal(|ui| {
                             ui.label(format!("{}", task.state.emoji()));
                             ui.colored_label(task.priority.color(), format!("[{}]", task.priority.to_string()));
                             ui.label(&task.name);
+                            ui.label(task.format_duration());
                             if task.progress > 0 {
                                 ui.label(format!("{}%", task.progress));
                             } else if task.ramp_up_progress > 0 {
@@ -583,26 +768,33 @@ impl eframe::App for TaskQueueApp {
             
             ui.separator();
             
-            // Приостановленные задачи
             ui.collapsing("⏸ Приостановленные задачи", |ui| {
-                let paused_items: Vec<(u64, String, Priority, u8, f32)> = self.paused_pool
+                let paused_items: Vec<(u64, String, Priority, u8, f32, String)> = self.paused_pool
                     .get_all()
                     .iter()
-                    .map(|task| (task.id, task.name.clone(), task.priority.clone(), task.progress, task.get_remaining_time_secs()))
+                    .map(|task| (task.id, task.name.clone(), task.priority.clone(), task.progress, 
+                                 task.get_remaining_time_secs(), task.format_duration()))
                     .collect();
                 
                 if paused_items.is_empty() {
                     ui.label("Нет приостановленных задач");
                 } else {
-                    for (id, name, priority, progress, remaining) in paused_items {
+                    ui.columns(5, |columns| {
+                        columns[0].label("Состояние");
+                        columns[1].label("Приоритет");
+                        columns[2].label("Название");
+                        columns[3].label("Время");
+                        columns[4].label("Инфо");
+                    });
+                    for (id, name, priority, progress, remaining, duration) in paused_items {
                         ui.horizontal(|ui| {
                             ui.label("⏸");
                             ui.colored_label(priority.color(), format!("[{}]", priority.to_string()));
                             ui.label(&name);
-                            ui.label(format!("Прогресс: {}%", progress));
-                            ui.label(format!("⏱️ осталось: {:.1}с", remaining));
+                            ui.label(duration);
+                            ui.label(format!("{}%, осталось {:.1}с", progress, remaining));
                             
-                            if ui.button("▶ Возобновить").clicked() {
+                            if ui.button("▶").clicked() {
                                 if let Some(resumed_task) = self.paused_pool.remove(id) {
                                     self.queue.resume_task(resumed_task);
                                     self.status_message = format!("Задача {} возобновлена", name);
@@ -616,18 +808,15 @@ impl eframe::App for TaskQueueApp {
             ui.separator();
             
             ui.colored_label(egui::Color32::from_rgb(100, 100, 100), 
-                "ℹ️ Управление: кнопки вверху | Приоритеты: Critical > High > Medium > Low | 1 шаг = 100 мс");
+                "ℹ️ Приоритеты: Critical > High > Medium > Low | 1 шаг = 100 мс | При паузе запуск/завершение сбрасываются");
         });
     }
 }
 
-// ============================================
-// ГЛАВНАЯ ФУНКЦИЯ
-// ============================================
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 700.0])
+            .with_inner_size([950.0, 750.0])
             .with_title("Очередь с приоритетом - Rust Lab"),
         ..Default::default()
     };
