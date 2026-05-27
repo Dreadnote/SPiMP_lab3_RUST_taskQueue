@@ -102,6 +102,15 @@ impl TaskState {
             TaskState::Paused => "Пауза",
         }
     }
+    
+    fn progress_color(&self) -> egui::Color32 {
+        match self {
+            TaskState::RampingUp => egui::Color32::from_rgb(255, 200, 0),
+            TaskState::Running => egui::Color32::from_rgb(50, 100, 255),
+            TaskState::RampingDown => egui::Color32::from_rgb(50, 200, 50),
+            _ => egui::Color32::from_rgb(100, 100, 100),
+        }
+    }
 }
 
 // ============================================
@@ -228,7 +237,7 @@ impl Task {
                 remaining_steps as f32 / 10.0
             }
             TaskState::Paused => {
-                let remaining_steps = self.total_steps - (self.progress as u32 * self.total_steps / 100);
+                let remaining_steps = self.total_steps - (self.saved_progress as u32 * self.total_steps / 100);
                 remaining_steps as f32 / 10.0
             }
             _ => 0.0,
@@ -253,7 +262,7 @@ impl Task {
             self.ramp_up_progress = 0;
             self.ramp_down_progress = 0;
             self.ramping_step = 0;
-            self.current_step = (self.progress as u32 * self.total_steps / 100);
+            self.current_step = self.progress as u32 * self.total_steps / 100;
         }
     }
 }
@@ -303,17 +312,19 @@ impl PriorityQueue {
         self.heap.push(task);
     }
     
-    fn step_current(&mut self) -> bool {
+    fn step_current(&mut self) -> Option<Task> {
         if let Some(mut task) = self.heap.pop() {
             let completed = task.step();
-            if !completed && task.state != TaskState::Completed {
-                self.heap.push(task);
-                false
+            if completed {
+                Some(task)
+            } else if task.state == TaskState::Paused {
+                Some(task)
             } else {
-                true
+                self.heap.push(task);
+                None
             }
         } else {
-            false
+            None
         }
     }
     
@@ -369,6 +380,27 @@ impl PausedPool {
         } else {
             None
         }
+    }
+    
+    fn get_all(&self) -> &[Task] {
+        &self.tasks
+    }
+}
+
+// ============================================
+// ВЫПОЛНЕННЫЕ ЗАДАЧИ
+// ============================================
+struct CompletedPool {
+    tasks: Vec<Task>,
+}
+
+impl CompletedPool {
+    fn new() -> Self {
+        CompletedPool { tasks: Vec::new() }
+    }
+    
+    fn add(&mut self, task: Task) {
+        self.tasks.push(task);
     }
     
     fn get_all(&self) -> &[Task] {
@@ -438,6 +470,7 @@ fn random_task_name() -> String {
 struct TaskQueueApp {
     queue: PriorityQueue,
     paused_pool: PausedPool,
+    completed_pool: CompletedPool,
     simulation_running: bool,
     new_task_name: String,
     new_task_priority: Priority,
@@ -455,6 +488,7 @@ impl TaskQueueApp {
         let mut app = TaskQueueApp {
             queue: PriorityQueue::new(),
             paused_pool: PausedPool::new(),
+            completed_pool: CompletedPool::new(),
             simulation_running: true,
             new_task_name: String::new(),
             new_task_priority: Priority::Medium,
@@ -477,7 +511,15 @@ impl TaskQueueApp {
     
     fn update_simulation(&mut self) {
         if self.simulation_running {
-            let _completed = self.queue.step_current();
+            if let Some(task) = self.queue.step_current() {
+                if task.state == TaskState::Completed {
+                    self.completed_pool.add(task);
+                    self.status_message = "Задача выполнена".to_string();
+                } else if task.state == TaskState::Paused {
+                    self.paused_pool.add(task);
+                    self.status_message = "Задача приостановлена".to_string();
+                }
+            }
         }
     }
     
@@ -539,12 +581,11 @@ impl eframe::App for TaskQueueApp {
                     self.simulation_running = true;
                     self.status_message = "Симуляция запущена".to_string();
                 }
-                if ui.button("⏸ Приостановить активную задачу").clicked() {
+                if ui.button("⏸ Приостановить задачу").clicked() {
                     if let Some(paused_task) = self.queue.pause_current_task() {
-                        self.paused_pool.add(paused_task);
-                        self.status_message = "Активная задача приостановлена".to_string();
+                        self.status_message = format!("Задача '{}' приостановлена", paused_task.name);
                     } else {
-                        self.status_message = "Нет активной задачи для приостановки".to_string();
+                        self.status_message = "Нет активной задачи".to_string();
                     }
                 }
                 if ui.button("➕ Новая задача").clicked() {
@@ -602,7 +643,7 @@ impl eframe::App for TaskQueueApp {
                     ui.label("⏱️ Временные параметры (секунды):");
                     
                     ui.horizontal(|ui| {
-                        ui.label("🚀 Запуск (ramp-up):");
+                        ui.label("🚀 Запуск:");
                         ui.add(egui::DragValue::new(&mut self.new_task_ramp_up)
                             .clamp_range(0..=10)
                             .speed(0.5));
@@ -626,7 +667,7 @@ impl eframe::App for TaskQueueApp {
                     });
                     
                     ui.horizontal(|ui| {
-                        ui.label("💾 Завершение (ramp-down):");
+                        ui.label("💾 Завершение:");
                         ui.add(egui::DragValue::new(&mut self.new_task_ramp_down)
                             .clamp_range(0..=10)
                             .speed(0.5));
@@ -695,15 +736,16 @@ impl eframe::App for TaskQueueApp {
             ui.heading("🎯 Симулятор очереди с приоритетом");
             ui.separator();
             
+            // АКТИВНАЯ ЗАДАЧА
             ui.collapsing("📌 Активная задача", |ui| {
                 let current_task_info = self.queue.current_task().map(|task| {
                     (task.name.clone(), task.priority.clone(), task.state.clone(), 
                      task.display_progress(), task.ramp_up_progress, task.progress, 
                      task.ramp_down_progress, task.get_remaining_time_secs(),
-                     task.format_duration())
+                     task.format_duration(), task.state.progress_color())
                 });
                 
-                if let Some((name, priority, state, progress, ramp_up, running_progress, ramp_down, remaining_time, duration)) = current_task_info {
+                if let Some((name, priority, state, progress, ramp_up, running_progress, ramp_down, remaining_time, duration, color)) = current_task_info {
                     ui.horizontal(|ui| {
                         ui.label(format!("{} {}", state.emoji(), name));
                         ui.colored_label(priority.color(), priority.to_string());
@@ -714,7 +756,8 @@ impl eframe::App for TaskQueueApp {
                     
                     let progress_bar = egui::ProgressBar::new(progress)
                         .desired_width(400.0)
-                        .show_percentage();
+                        .show_percentage()
+                        .fill(color);
                     ui.add(progress_bar);
                     
                     match state {
@@ -736,6 +779,7 @@ impl eframe::App for TaskQueueApp {
             
             ui.separator();
             
+            // ОЧЕРЕДЬ ЗАДАЧ
             ui.collapsing("📋 Очередь задач", |ui| {
                 let tasks = self.queue.get_all_tasks();
                 if tasks.is_empty() {
@@ -768,11 +812,12 @@ impl eframe::App for TaskQueueApp {
             
             ui.separator();
             
+            // ПРИОСТАНОВЛЕННЫЕ ЗАДАЧИ
             ui.collapsing("⏸ Приостановленные задачи", |ui| {
                 let paused_items: Vec<(u64, String, Priority, u8, f32, String)> = self.paused_pool
                     .get_all()
                     .iter()
-                    .map(|task| (task.id, task.name.clone(), task.priority.clone(), task.progress, 
+                    .map(|task| (task.id, task.name.clone(), task.priority.clone(), task.saved_progress, 
                                  task.get_remaining_time_secs(), task.format_duration()))
                     .collect();
                 
@@ -807,8 +852,34 @@ impl eframe::App for TaskQueueApp {
             
             ui.separator();
             
+            // ВЫПОЛНЕННЫЕ ЗАДАЧИ
+            ui.collapsing("✅ Выполненные задачи", |ui| {
+                let completed_items = self.completed_pool.get_all();
+                if completed_items.is_empty() {
+                    ui.label("Нет выполненных задач");
+                } else {
+                    ui.columns(4, |columns| {
+                        columns[0].label("Приоритет");
+                        columns[1].label("Название");
+                        columns[2].label("Время");
+                        columns[3].label("Результат");
+                    });
+                    for task in completed_items.iter().rev() {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(task.priority.color(), format!("[{}]", task.priority.to_string()));
+                            ui.label(&task.name);
+                            ui.label(task.format_duration());
+                            ui.label("✅ выполнена");
+                        });
+                    }
+                }
+            });
+            
+            ui.separator();
+            
             ui.colored_label(egui::Color32::from_rgb(100, 100, 100), 
-                "ℹ️ Приоритеты: Critical > High > Medium > Low | 1 шаг = 100 мс | При паузе запуск/завершение сбрасываются");
+                "ℹ️ Приоритеты: Critical > High > Medium > Low | 1 шаг = 100 мс\n\
+                   🟡 Жёлтый - запуск | 🔵 Синий - выполнение | 🟢 Зелёный - завершение");
         });
     }
 }
